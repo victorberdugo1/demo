@@ -12,42 +12,13 @@ const DEFAULTS = {
 };
 
 const CHIPS = [
-  {
-    text: 'Make it deep blue and very shiny',
-    delta: { baseColor: [0.05, 0.15, 0.8], roughness: 0.1, explanation: 'Deep blue and very shiny.' },
-  },
-  {
-    text: 'Warm sunset light from the left, strong shadows',
-    delta: {
-      lightColor: [1, 0.55, 0.25],
-      lightDir: [-1, 0.2, 0.4],
-      shadowStrength: 0.9,
-      explanation: 'Warm sunset light from the left with strong shadows.',
-    },
-  },
-  {
-    text: 'Matte emerald green, soft ambient light',
-    delta: {
-      baseColor: [0.08, 0.65, 0.35],
-      roughness: 0.95,
-      ambient: 0.55,
-      shadowStrength: 0.2,
-      explanation: 'Matte emerald green with soft ambient light.',
-    },
-  },
-  {
-    text: 'Gold metal, harsh light from above',
-    delta: {
-      baseColor: [1, 0.78, 0.3],
-      roughness: 0.2,
-      lightColor: [1, 0.95, 0.85],
-      lightDir: [0, 1, 0.3],
-      lightIntensity: 1.6,
-      shadowStrength: 0.8,
-      explanation: 'Polished gold under harsh overhead light.',
-    },
-  },
+  'Make it deep blue and very shiny',
+  'Warm sunset light from the left, strong shadows',
+  'Matte emerald green, soft ambient light',
+  'Gold metal, harsh light from above',
 ];
+
+const GEMMA_FAILED = 'Gemma could not answer right now. Please try again in a few seconds.';
 
 const VERTEX = `#version 300 es
 in vec2 corner;
@@ -80,7 +51,6 @@ function toast(message) {
 
 function startRenderer(canvas) {
   const gl = canvas.getContext('webgl2');
-  if (!gl) throw new Error('WebGL2 is not supported in this browser');
 
   const program = gl.createProgram();
   for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX], [gl.FRAGMENT_SHADER, FRAG]]) {
@@ -93,7 +63,6 @@ function startRenderer(canvas) {
   gl.linkProgram(program);
   gl.useProgram(program);
 
-  // Two triangles that cover the whole screen: the fragment shader then colors every pixel itself.
   gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
   const corner = gl.getAttribLocation(program, 'corner');
@@ -136,19 +105,9 @@ async function postJson(url, body) {
   });
   if (!response.ok) {
     const { error } = await response.json().catch(() => ({}));
-    throw Object.assign(new Error(error ?? 'Request failed'), { status: response.status });
+    throw new Error(error ?? 'Request failed');
   }
   return response;
-}
-
-function offlineDelta(input) {
-  const chip = CHIPS.find(({ text }) => text.toLowerCase() === input.toLowerCase());
-  if (chip) return chip.delta;
-  try {
-    return JSON.parse(input);
-  } catch {
-    return null;
-  }
 }
 
 async function speak(message) {
@@ -156,30 +115,27 @@ async function speak(message) {
     const response = await postJson('/api/speak', { text: message });
     new Audio(URL.createObjectURL(await response.blob())).play();
   } catch (error) {
-    toast(error.status === 503 ? 'ElevenLabs key missing: voice disabled' : error.message);
+    console.error(error);
   }
 }
 
 async function runCommand(input) {
   const text = input.trim();
   if (!text) return;
+  $('say').textContent = '';
+  $('panel').classList.add('busy');
   try {
-    let response;
-    try {
-      response = await postJson('/api/command', { text, params });
-    } catch (error) {
-      if (error.status !== 503) throw error;
-      const delta = offlineDelta(text);
-      if (!delta) return toast(`${error.message}: use a preset or paste a JSON delta`);
-      toast(`${error.message}: applying preset values`);
-      response = await postJson('/api/command', { delta, params });
-    }
+    const response = await postJson('/api/command', { text, params });
     const { params: next, explanation } = await response.json();
     setParams(next);
     $('say').textContent = explanation;
     speak(explanation);
   } catch (error) {
-    toast(error.message);
+    console.error(error);
+    toast(GEMMA_FAILED);
+    speak(GEMMA_FAILED);
+  } finally {
+    $('panel').classList.remove('busy');
   }
 }
 
@@ -192,22 +148,17 @@ const toBase64 = (blob) =>
 
 let holding = false;
 let recorder;
-let recognition;
-let heard = '';
-let heardDone = Promise.resolve();
 
 async function transcribe(blob) {
-  let text;
   try {
-    ({ text } = await (await postJson('/api/transcribe', { audioBase64: await toBase64(blob) })).json());
+    const response = await postJson('/api/transcribe', { audioBase64: await toBase64(blob) });
+    const { text } = await response.json();
+    if (!text) return toast("Didn't catch that");
+    $('text').value = text;
+    runCommand(text);
   } catch (error) {
-    toast(error.status === 503 ? 'ElevenLabs key missing: using browser speech' : `${error.message}: using browser speech`);
-    await heardDone;
-    text = heard;
+    toast(error.message);
   }
-  if (!text) return toast("Didn't catch that");
-  $('text').value = text;
-  runCommand(text);
 }
 
 async function startTalking() {
@@ -229,28 +180,15 @@ async function startTalking() {
     transcribe(new Blob(chunks));
   };
   recorder.start();
-
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  heard = '';
-  recognition = SpeechRecognition ? new SpeechRecognition() : null;
-  if (recognition) {
-    recognition.interimResults = true;
-    recognition.onresult = (event) => (heard = [...event.results].map((result) => result[0].transcript).join(' '));
-    heardDone = new Promise((resolve) => (recognition.onend = resolve));
-    recognition.start();
-  } else {
-    heardDone = Promise.resolve();
-  }
 }
 
 function stopTalking() {
   holding = false;
   $('mic').classList.remove('live');
   if (recorder?.state === 'recording') recorder.stop();
-  recognition?.stop();
 }
 
-for (const { text } of CHIPS) {
+for (const text of CHIPS) {
   const chip = document.createElement('button');
   chip.textContent = text;
   chip.onclick = () => {
@@ -274,8 +212,4 @@ $('mic').onpointerleave = stopTalking;
 $('mic').onpointercancel = stopTalking;
 
 setParams(params);
-try {
-  startRenderer($('canvas'));
-} catch (error) {
-  toast(error.message);
-}
+startRenderer($('canvas'));
