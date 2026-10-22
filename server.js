@@ -2,123 +2,87 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { GEMMA_API_KEY, ELEVENLABS_API_KEY, PORT = 3000 } = process.env;
-
-const GEMMA_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemma-4-31b-it:generateContent';
+const { ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, PORT = 3000 } = process.env;
 const ELEVEN_URL = 'https://api.elevenlabs.io/v1';
-const VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
-const FILE_TYPES = { '.html': 'text/html', '.js': 'text/javascript' };
-
-const SYSTEM_PROMPT = [
-  'You are a shader parameter translator.',
-  'Only return fields the user asked to change.',
-  'Never invent colors the user did not mention.',
-  'Colors are [r, g, b] with each value 0..1.',
-  'lightDir points from the sphere toward the light: +x is right, +y is up, +z is toward the viewer.',
-  'Set animateLight to true only if the user asks for the light to move.',
-  'explanation is one short sentence describing what changed, written in the same language as the command.',
+const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
+const VOICES = { es: 'p4zZMQfmG6U1aRDEIlF6', en: 'cdnpdcqt2HW1XtKv2f3V', ru: 'WTn2eCRCpoFAC50VD351' };
+const SPEEDS = { es: 0.8 };
+const PROMPT = [
+  'You are a friendly, patient homework tutor for children.',
+  'Explain simply with everyday examples. Do not give final answers: guide with hints, questions and small examples, and let the child take the next step.',
+  'If the child is stuck, give a smaller hint or a worked example of a similar problem, then ask them to try.',
+  'Encourage every attempt and celebrate progress warmly.',
+  'Your reply is spoken aloud: keep it to one to three short sentences in plain conversational language, with no lists, markdown or emojis.',
+  'Always reply in the same language the child speaks, and switch language when the child asks you to.',
+  "Never assume the child's age, grade, curriculum or assignment; ask one short question if you need to know.",
+  'Steer unrelated topics back to learning. Keep everything safe and appropriate for children.',
 ].join(' ');
-
-const nullable = (schema) => ({ ...schema, nullable: true });
-const vec3 = nullable({ type: 'array', items: { type: 'number' }, minItems: 3, maxItems: 3 });
-const number = nullable({ type: 'number' });
-
-const SCHEMA = {
-  type: 'object',
-  properties: {
-    baseColor: vec3,
-    lightColor: vec3,
-    lightDir: vec3,
-    lightIntensity: number,
-    roughness: number,
-    shadowStrength: number,
-    ambient: number,
-    animateLight: nullable({ type: 'boolean' }),
-    explanation: { type: 'string' },
-  },
-  required: ['explanation'],
-};
-
-async function askGemma(text, params) {
-  const response = await fetch(GEMMA_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMMA_API_KEY },
-    body: JSON.stringify({
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts: [{ text: `Current params: ${JSON.stringify(params)}\nCommand: ${text}` }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SCHEMA,
-        thinkingConfig: { thinkingLevel: 'minimal' },
+const AGENT_CONFIG = {
+  agent: {
+    language: 'es',
+    first_message: '¡Hola! Soy tu compañero de deberes. ¿Qué estamos aprendiendo hoy?',
+    prompt: {
+      prompt: PROMPT,
+      built_in_tools: {
+        language_detection: {
+          type: 'system',
+          name: 'language_detection',
+          description: '',
+          params: { system_tool_type: 'language_detection' },
+        },
       },
-    }),
-    signal: AbortSignal.timeout(20000),
-  });
-  if (!response.ok) {
-    const { error } = await response.json().catch(() => ({}));
-    throw new Error(`Gemma ${response.status}: ${error?.message ?? 'request failed'}`);
-  }
-  const { candidates } = await response.json();
-  const parts = candidates?.[0]?.content?.parts ?? [];
-  return JSON.parse(parts.filter((part) => !part.thought).map((part) => part.text).join(''));
-}
-
-const routes = {
-  '/api/command': async ({ text, params }) => {
-    const { explanation, ...changes } = await askGemma(text, params);
-    const accepted = Object.entries(changes).filter(([key, value]) => value != null && key in params);
-    return { params: { ...params, ...Object.fromEntries(accepted) }, explanation };
+    },
   },
-
-  '/api/speak': async ({ text }) => {
-    const response = await fetch(`${ELEVEN_URL}/text-to-speech/${VOICE_ID}`, {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json', Accept: 'audio/mpeg' },
-      body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5' }),
-    });
-    if (!response.ok) throw new Error(`ElevenLabs request failed (${response.status})`);
-    return Buffer.from(await response.arrayBuffer());
-  },
-
-  '/api/transcribe': async ({ audioBase64 }) => {
-    const form = new FormData();
-    form.append('model_id', 'scribe_v2');
-    form.append('file', new Blob([Buffer.from(audioBase64, 'base64')]), 'audio.webm');
-    const response = await fetch(`${ELEVEN_URL}/speech-to-text`, {
-      method: 'POST',
-      headers: { 'xi-api-key': ELEVENLABS_API_KEY },
-      body: form,
-    });
-    if (!response.ok) throw new Error(`ElevenLabs request failed (${response.status})`);
-    return { text: (await response.json()).text };
-  },
+  tts: { model_id: 'eleven_flash_v2_5', voice_id: VOICES.es, stability: 0.75, similarity_boost: 0.75, speed: SPEEDS.es },
+  language_presets: Object.fromEntries(
+    Object.entries(VOICES).map(([language, voice_id]) => [language, { overrides: { tts: { voice_id, speed: SPEEDS[language] ?? 1 } } }]),
+  ),
 };
+
+const elevenRequest = async (url, init = {}) => {
+  const response = await fetch(url, {
+    ...init,
+    headers: { 'xi-api-key': ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) throw new Error(`ElevenLabs ${response.status} ${await response.text()}`);
+  return response.json();
+};
+
+const session = () => {
+  const url = new URL(`${ELEVEN_URL}/convai/conversation/get-signed-url`);
+  url.searchParams.set('agent_id', ELEVENLABS_AGENT_ID);
+  return elevenRequest(url);
+};
+
+const configureAgent = () =>
+  elevenRequest(`${ELEVEN_URL}/convai/agents/${ELEVENLABS_AGENT_ID}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ conversation_config: AGENT_CONFIG }),
+  });
 
 const send = (res, status, body, type = 'application/json') => {
   res.writeHead(status, { 'Content-Type': type });
   res.end(body);
 };
 
-async function readJson(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return JSON.parse(Buffer.concat(chunks).toString() || '{}');
-}
-
 http
   .createServer(async (req, res) => {
     try {
       const { pathname } = new URL(req.url, 'http://localhost');
-      if (req.method === 'POST' && routes[pathname]) {
-        const result = await routes[pathname](await readJson(req));
-        return Buffer.isBuffer(result) ? send(res, 200, result, 'audio/mpeg') : send(res, 200, JSON.stringify(result));
+      if (req.method === 'POST' && pathname === '/api/session') {
+        return send(res, 200, JSON.stringify(await session()));
       }
       const file = path.join('public', pathname === '/' ? 'index.html' : pathname);
-      send(res, 200, await fs.promises.readFile(file), FILE_TYPES[path.extname(file)]);
+      send(res, 200, await fs.promises.readFile(file), TYPES[path.extname(file)]);
     } catch (error) {
       const status = error.code === 'ENOENT' ? 404 : 500;
-      if (status !== 404) console.error(req.method, req.url, error.message);
+      if (status === 500) console.error(req.method, req.url, error.message);
       send(res, status, JSON.stringify({ error: error.message }));
     }
   })
-  .listen(PORT, () => console.log(`listening on ${PORT}`));
+  .listen(PORT, () => {
+    console.log(`listening on ${PORT}`);
+    configureAgent()
+      .then(() => console.log('agent configured'))
+      .catch((error) => console.error('agent configuration failed:', error.message));
+  });

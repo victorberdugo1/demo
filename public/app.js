@@ -1,215 +1,88 @@
-import { FRAG } from './shader.frag.js';
-
-const DEFAULTS = {
-  baseColor: [0.35, 0.55, 0.95],
-  lightColor: [1, 1, 1],
-  lightDir: [-0.5, 0.6, 0.7],
-  lightIntensity: 1,
-  roughness: 0.5,
-  shadowStrength: 0.5,
-  ambient: 0.2,
-  animateLight: false,
-};
-
-const CHIPS = [
-  'Make it deep blue and very shiny',
-  'Warm sunset light from the left, strong shadows',
-  'Matte emerald green, soft ambient light',
-  'Gold metal, harsh light from above',
-];
-
-const GEMMA_FAILED = 'Gemma could not answer right now. Please try again in a few seconds.';
-
-const VERTEX = `#version 300 es
-in vec2 corner;
-void main() { gl_Position = vec4(corner, 0.0, 1.0); }`;
-
-const UNIFORMS = [
-  'uTime', 'uResolution', 'uBaseColor', 'uLightColor', 'uLightDir',
-  'uLightIntensity', 'uRoughness', 'uShadowStrength', 'uAmbient',
-];
+import { Conversation } from 'https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.30.0/+esm';
 
 const $ = (id) => document.getElementById(id);
+const GREETING = 'Hi there! I am your homework buddy. What are we learning today?';
+const STATUS = {
+  idle: 'Tap the microphone and ask me anything!',
+  connecting: 'Connecting…',
+  listening: 'Listening… go ahead, I am ready.',
+  speaking: 'Here is my answer!',
+};
+const ERRORS = {
+  mic: 'Microphone unavailable. Please allow microphone access.',
+  connect: 'I could not connect right now. Please try again in a few seconds.',
+  session: 'Something went wrong. Please try again.',
+};
+const CHIPS = ['Help me with my homework', 'What is a fraction?', 'Why is the sky blue?'];
+const turns = [];
+let conversation;
+let starting = false;
 
-let params = structuredClone(DEFAULTS);
-
-function setParams(next) {
-  params = next;
-  const round = (_, value) => (typeof value === 'number' ? Math.round(value * 100) / 100 : value);
-  $('readout').textContent = Object.entries(params)
-    .map(([key, value]) => `${key}: ${JSON.stringify(value, round)}`)
-    .join('\n');
+function setState(state, message = STATUS[state]) {
+  document.body.dataset.state = state;
+  $('status').textContent = message;
 }
 
-let toastTimer;
-function toast(message) {
-  $('toast').textContent = message;
-  $('toast').hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ($('toast').hidden = true), 4000);
+function render() {
+  $('log').replaceChildren(...turns.map(({ role, text }) => Object.assign(document.createElement('li'), { className: role, textContent: text })));
+  $('log').scrollTop = $('log').scrollHeight;
+  $('subtitle').textContent = turns.findLast((turn) => turn.role === 'model')?.text ?? GREETING;
 }
 
-function startRenderer(canvas) {
-  const gl = canvas.getContext('webgl2');
-
-  const program = gl.createProgram();
-  for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX], [gl.FRAGMENT_SHADER, FRAG]]) {
-    const shader = gl.createShader(type);
-    gl.shaderSource(shader, source);
-    gl.compileShader(shader);
-    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(shader));
-    gl.attachShader(program, shader);
-  }
-  gl.linkProgram(program);
-  gl.useProgram(program);
-
-  gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
-  const corner = gl.getAttribLocation(program, 'corner');
-  gl.enableVertexAttribArray(corner);
-  gl.vertexAttribPointer(corner, 2, gl.FLOAT, false, 0, 0);
-
-  const loc = Object.fromEntries(UNIFORMS.map((name) => [name, gl.getUniformLocation(program, name)]));
-
-  const frame = (ms) => {
-    const width = Math.round(innerWidth * devicePixelRatio);
-    const height = Math.round(innerHeight * devicePixelRatio);
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
-    }
-    gl.viewport(0, 0, width, height);
-
-    const spin = params.animateLight ? ms / 1000 : 0;
-    const [x, y, z] = params.lightDir;
-    gl.uniform1f(loc.uTime, ms / 1000);
-    gl.uniform2f(loc.uResolution, width, height);
-    gl.uniform3fv(loc.uBaseColor, params.baseColor);
-    gl.uniform3fv(loc.uLightColor, params.lightColor);
-    gl.uniform3f(loc.uLightDir, x * Math.cos(spin) + z * Math.sin(spin), y, z * Math.cos(spin) - x * Math.sin(spin));
-    gl.uniform1f(loc.uLightIntensity, params.lightIntensity);
-    gl.uniform1f(loc.uRoughness, params.roughness);
-    gl.uniform1f(loc.uShadowStrength, params.shadowStrength);
-    gl.uniform1f(loc.uAmbient, params.ambient);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    requestAnimationFrame(frame);
-  };
-  requestAnimationFrame(frame);
-}
-
-async function postJson(url, body) {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const { error } = await response.json().catch(() => ({}));
-    throw new Error(error ?? 'Request failed');
-  }
-  return response;
-}
-
-async function speak(message) {
+async function startConversation() {
+  if (conversation || starting) return;
+  starting = true;
+  setState('connecting');
   try {
-    const response = await postJson('/api/speak', { text: message });
-    new Audio(URL.createObjectURL(await response.blob())).play();
+    const { signed_url: signedUrl } = await (await fetch('/api/session', { method: 'POST' })).json();
+    conversation = await Conversation.startSession({
+      signedUrl,
+      onConnect: () => setState('listening'),
+      onDisconnect: () => {
+        conversation = undefined;
+        if (document.body.dataset.state !== 'error') setState('idle');
+      },
+      onModeChange: ({ mode }) => setState(mode),
+      onMessage: ({ message, source }) => {
+        turns.push({ role: source === 'user' ? 'user' : 'model', text: message });
+        render();
+      },
+      onError: () => setState('error', ERRORS.session),
+    });
   } catch (error) {
-    console.error(error);
-  }
-}
-
-async function runCommand(input) {
-  const text = input.trim();
-  if (!text) return;
-  $('say').textContent = '';
-  $('panel').classList.add('busy');
-  try {
-    const response = await postJson('/api/command', { text, params });
-    const { params: next, explanation } = await response.json();
-    setParams(next);
-    $('say').textContent = explanation;
-    speak(explanation);
-  } catch (error) {
-    console.error(error);
-    toast(GEMMA_FAILED);
-    speak(GEMMA_FAILED);
+    setState('error', error.name === 'NotAllowedError' ? ERRORS.mic : ERRORS.connect);
   } finally {
-    $('panel').classList.remove('busy');
+    starting = false;
   }
 }
 
-const toBase64 = (blob) =>
-  new Promise((resolve) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result.split(',')[1]);
-    reader.readAsDataURL(blob);
-  });
-
-let holding = false;
-let recorder;
-
-async function transcribe(blob) {
-  try {
-    const response = await postJson('/api/transcribe', { audioBase64: await toBase64(blob) });
-    const { text } = await response.json();
-    if (!text) return toast("Didn't catch that");
-    $('text').value = text;
-    runCommand(text);
-  } catch (error) {
-    toast(error.message);
-  }
+async function ask(text) {
+  const message = text.trim();
+  if (!message) return;
+  await startConversation();
+  if (!conversation) return;
+  turns.push({ role: 'user', text: message });
+  $('text').value = '';
+  render();
+  conversation.sendUserMessage(message);
 }
 
-async function startTalking() {
-  holding = true;
-  $('mic').classList.add('live');
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    return toast('Microphone unavailable');
-  }
-  if (!holding) return stream.getTracks().forEach((track) => track.stop());
-
-  const chunks = [];
-  recorder = new MediaRecorder(stream);
-  recorder.ondataavailable = (event) => chunks.push(event.data);
-  recorder.onstop = () => {
-    stream.getTracks().forEach((track) => track.stop());
-    transcribe(new Blob(chunks));
-  };
-  recorder.start();
-}
-
-function stopTalking() {
-  holding = false;
-  $('mic').classList.remove('live');
-  if (recorder?.state === 'recording') recorder.stop();
+async function toggleConversation() {
+  if (conversation) return conversation.endSession();
+  await startConversation();
 }
 
 for (const text of CHIPS) {
-  const chip = document.createElement('button');
-  chip.textContent = text;
-  chip.onclick = () => {
-    $('text').value = text;
-    runCommand(text);
-  };
-  $('chips').append(chip);
+  $('chips').append(Object.assign(document.createElement('button'), { className: 'chip', textContent: text, onclick: () => ask(text) }));
 }
-
 $('form').onsubmit = (event) => {
   event.preventDefault();
-  runCommand($('text').value);
+  ask($('text').value);
 };
-$('reset').onclick = () => {
-  setParams(structuredClone(DEFAULTS));
-  $('say').textContent = '';
+$('mic').onclick = toggleConversation;
+$('clear').onclick = () => {
+  turns.length = 0;
+  render();
+  conversation?.endSession();
 };
-$('mic').onpointerdown = startTalking;
-$('mic').onpointerup = stopTalking;
-$('mic').onpointerleave = stopTalking;
-$('mic').onpointercancel = stopTalking;
-
-setParams(params);
-startRenderer($('canvas'));
+render();

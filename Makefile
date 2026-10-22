@@ -5,9 +5,9 @@ up: .env
 	@echo "Open http://localhost:3000"
 
 .env:
-	@printf "GEMMA_API_KEY: "; read gemma; \
-	printf "ELEVENLABS_API_KEY: "; read eleven; \
-	printf "GEMMA_API_KEY=%s\nELEVENLABS_API_KEY=%s\n" "$$gemma" "$$eleven" > .env
+	@printf "ELEVENLABS_API_KEY: "; read eleven; \
+	printf "ELEVENLABS_AGENT_ID: "; read agent; \
+	printf "ELEVENLABS_API_KEY=%s\nELEVENLABS_AGENT_ID=%s\n" "$$eleven" "$$agent" > .env
 
 keys:
 	rm -f .env
